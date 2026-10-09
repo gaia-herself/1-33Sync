@@ -7,6 +7,7 @@
 //   Step 2: Pull every member's name + lady id out of that HTML,
 //           then remove the ladies in the exclusion set.
 //   Step 3: Send one rating (3) request for each remaining lady.
+//           Safety check: if ALL of the first 5 ratings fail, stop.
 // ================================================================
 
 
@@ -35,6 +36,11 @@ const EXCLUDED_LADY_NAMES = [
 // Pause between two rating requests (milliseconds).
 // Keeps us from hammering the server.
 const DELAY_BETWEEN_RATINGS_MS = 500;
+
+// Safety check: if ALL of the first N rating requests fail (anything other
+// than success), we assume something is wrong (bad token, logged out,
+// wrong guild...) and stop without sending the remaining ratings.
+const EARLY_ABORT_CHECK_COUNT = 5;
 
 // The game's base address. All internal requests go here.
 const BASE_URL = 'https://v3.g.ladypopular.com';
@@ -188,26 +194,29 @@ module.exports = async function runRate(page) {
     );
   }
 
+  // The GraphQL mutation, copied from the request you captured.
+  // $ladyId and $rating are filled in from "variables" below.
+  const query =
+    'mutation ProfilePodiumVote($ladyId: Int!, $rating: Int!) {\n' +
+    '  profile {\n' +
+    '    podiumvote(ladyId: $ladyId, rating: $rating) {\n' +
+    '      status\n' +
+    '      message\n' +
+    '      __typename\n' +
+    '    }\n' +
+    '    __typename\n' +
+    '  }\n' +
+    '}';
+
   let successCount = 0;
   let failCount = 0;
 
-  for (const lady of ladiesToRate) {
+  // We use an index-based loop so we know exactly when the 5th lady is done.
+  for (let i = 0; i < ladiesToRate.length; i++) {
+
+    const lady = ladiesToRate[i];
 
     try {
-
-      // The GraphQL mutation, copied from the request you captured.
-      // $ladyId and $rating are filled in from "variables" below.
-      const query =
-        'mutation ProfilePodiumVote($ladyId: Int!, $rating: Int!) {\n' +
-        '  profile {\n' +
-        '    podiumvote(ladyId: $ladyId, rating: $rating) {\n' +
-        '      status\n' +
-        '      message\n' +
-        '      __typename\n' +
-        '    }\n' +
-        '    __typename\n' +
-        '  }\n' +
-        '}';
 
       // Send the vote from inside the page (so cookies go along).
       const result = await page.evaluate(
@@ -249,13 +258,14 @@ module.exports = async function runRate(page) {
       const vote = result?.data?.profile?.podiumvote;
 
       if (vote && vote.status === 1) {
+        // ✅ Success
         successCount++;
         console.log(
           `⭐ ${lady.name} (id ${lady.id}) → rated ${RATING} ✅ ${vote.message}`
         );
       } else {
+        // ❌ Failure or anything unexpected
         failCount++;
-        // If there's no podiumvote, show the GraphQL error (if any).
         const reason =
           vote?.message ||
           result?.errors?.[0]?.message ||
@@ -267,11 +277,26 @@ module.exports = async function runRate(page) {
 
     } catch (err) {
 
-      // A network/script error for one lady must not stop the others.
+      // A network/script error for one lady counts as a failure,
+      // but must not crash the whole script.
       failCount++;
       console.log(
         `⭐ ${lady.name} (id ${lady.id}) → rated ${RATING} ❌ request failed: ${err.message}`
       );
+    }
+
+    // ============================================================
+    // 🛑 EARLY ABORT CHECK
+    // ============================================================
+    // Once we've tried exactly the first 5 ladies, look at the results.
+    // If successCount is still 0, then ALL 5 were failures (or any other
+    // non-success response), so we stop here and skip the rest.
+    // If at least one succeeded, we carry on normally.
+    if (i + 1 === EARLY_ABORT_CHECK_COUNT && successCount === 0) {
+      console.log(
+        `🛑 First ${EARLY_ABORT_CHECK_COUNT} ratings all failed. Skipping the remaining ${ladiesToRate.length - (i + 1)} ladies and ending.`
+      );
+      return; // ends rate.js immediately
     }
 
     // Short pause before the next lady.
